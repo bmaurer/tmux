@@ -60,8 +60,11 @@ struct control_block {
 /*
  * Exclusive pane state. ON streams normally; OFF is disabled and holds the
  * pane read gate; PAUSED has been paused with %pause; RESYNC has discarded its
- * backlog and owes a repaint (queued as a REPAINT block) while it keeps running
- * with its output discarded.
+ * backlog and owes a repaint (queued as a REPAINT block) while it keeps
+ * running. While in RESYNC the pane buffer stays anchored at the last
+ * rendered frame (up to a backstop) so that a small gap can be streamed
+ * losslessly on resume; a pane that produces more than a frame's worth while
+ * one drains owes another frame instead (see control_update_resyncs).
  */
 enum control_pane_state {
 	CONTROL_PANE_ON,
@@ -87,10 +90,20 @@ struct control_pane {
 	/*
 	 * History sequence and pane width when the client fell behind, used to
 	 * bound the RESYNC scrollback replay; a discontinuity or width change
-	 * degrades it to a repaint only.
+	 * degrades it to a repaint only. Both are re-anchored each time a
+	 * repaint frame is rendered.
 	 */
 	struct grid_history_state	 resync_state;
 	u_int				 resync_sx;
+
+	/*
+	 * Resume bookkeeping for RESYNC. last_repaint is the rendered size of
+	 * the frame in flight: a smaller gap is cheaper to stream than to
+	 * repaint again. resync_overflow is set when the anchored backlog was
+	 * released past the backstop, which forces the next frame.
+	 */
+	size_t				 last_repaint;
+	int				 resync_overflow;
 
 	int				 pending_flag;
 	TAILQ_ENTRY(control_pane)	 pending_entry;
@@ -157,6 +170,7 @@ struct control_state {
 
 static void	control_pane_resync(struct client *, struct window_pane *,
 		    struct control_pane *);
+static void	control_queue_repaint(struct client *, struct control_pane *);
 static void	control_update_resyncs(struct client *);
 static void	control_arm_output_timer(struct control_state *);
 static struct evbuffer *control_build_repaint(struct window_pane *,
@@ -349,9 +363,17 @@ control_pane_offset(struct client *c, struct window_pane *wp, int *off)
 		*off = 1;
 		return (NULL);
 	case CONTROL_PANE_PAUSED:
-	case CONTROL_PANE_RESYNC:
 		*off = 0;
 		return (NULL);
+	case CONTROL_PANE_RESYNC:
+		/*
+		 * Anchor the pane buffer at the last rendered frame so a small
+		 * gap can be streamed losslessly on resume; the anchor is
+		 * released past the backstop (control_write_output). Never
+		 * gates pane reads.
+		 */
+		*off = 0;
+		return (&cp->offset);
 	case CONTROL_PANE_ON:
 		break;
 	}
@@ -425,19 +447,43 @@ control_pause_pane(struct client *c, struct window_pane *wp)
 }
 
 /*
+ * Queue a repaint frame owed to a resynced pane; it is rendered lazily when
+ * the drain loop first reaches it (control_write_pending).
+ */
+static void
+control_queue_repaint(struct client *c, struct control_pane *cp)
+{
+	struct control_state	*cs = c->control_state;
+	struct control_block	*cb;
+
+	cb = xcalloc(1, sizeof *cb);
+	cb->type = CONTROL_BLOCK_REPAINT;
+	cb->t = get_timer();
+	TAILQ_INSERT_TAIL(&cs->all_blocks, cb, all_entry);
+	TAILQ_INSERT_TAIL(&cp->blocks, cb, entry);
+	if (!cp->pending_flag) {
+		TAILQ_INSERT_TAIL(&cs->pending_list, cp, pending_entry);
+		cp->pending_flag = 1;
+		cs->pending_count++;
+	}
+
+	bufferevent_enable(cs->write_event, EV_WRITE);
+	control_arm_output_timer(cs);
+}
+
+/*
  * Enter resync for a pane: discard the backlog, fast-forward the offsets to the
- * parser position, and queue a repaint block owed to the client (rendered
- * lazily when the drain loop reaches it). The pane keeps running with its
- * output discarded until the repaint has drained and a writable callback
- * resumes it (control_update_resyncs). A pause-after client is preempted here
- * rather than paused.
+ * parser position, and queue a repaint frame owed to the client. The pane
+ * keeps running until a frame drains with the pane quiet enough to resume
+ * (control_update_resyncs). A pause-after client is preempted here rather
+ * than paused.
  */
 static void
 control_pane_resync(struct client *c, struct window_pane *wp,
     struct control_pane *cp)
 {
 	struct control_state	*cs = c->control_state;
-	struct control_block	*cb, *first;
+	struct control_block	*first;
 
 	if (cp->state == CONTROL_PANE_RESYNC)
 		return;
@@ -460,22 +506,13 @@ control_pane_resync(struct client *c, struct window_pane *wp,
 	log_debug("%s: %s: resync %%%u", __func__, c->name, wp->id);
 
 	cp->state = CONTROL_PANE_RESYNC;
+	cp->resync_overflow = 0;
 	control_discard_pane(c, cp);
 	control_pane_clear_pending(cs, cp);
 	memcpy(&cp->offset, &wp->offset, sizeof cp->offset);
 	memcpy(&cp->queued, &wp->offset, sizeof cp->queued);
 
-	cb = xcalloc(1, sizeof *cb);
-	cb->type = CONTROL_BLOCK_REPAINT;
-	cb->t = get_timer();
-	TAILQ_INSERT_TAIL(&cs->all_blocks, cb, all_entry);
-	TAILQ_INSERT_TAIL(&cp->blocks, cb, entry);
-	TAILQ_INSERT_TAIL(&cs->pending_list, cp, pending_entry);
-	cp->pending_flag = 1;
-	cs->pending_count++;
-
-	bufferevent_enable(cs->write_event, EV_WRITE);
-	control_arm_output_timer(cs);
+	control_queue_repaint(c, cp);
 }
 
 /* Write a line. */
@@ -629,7 +666,22 @@ control_write_output(struct client *c, struct window_pane *wp)
 
 ignore:
 	log_debug("%s: %s: ignoring pane %%%u", __func__, c->name, wp->id);
-	window_pane_update_used_data(wp, &cp->offset, SIZE_MAX);
+	if (cp->state == CONTROL_PANE_RESYNC) {
+		/*
+		 * Keep cp->offset anchored where the last rendered frame
+		 * consumed to, so drain-complete can stream a small gap
+		 * losslessly, but cap what the anchor holds in the pane
+		 * buffer: past the backstop another frame is owed anyway, so
+		 * holding more buys nothing.
+		 */
+		window_pane_get_new_data(wp, &cp->offset, &new_size);
+		if (new_size > CONTROL_RESYNC_BACKLOG) {
+			window_pane_update_used_data(wp, &cp->offset,
+			    SIZE_MAX);
+			cp->resync_overflow = 1;
+		}
+	} else
+		window_pane_update_used_data(wp, &cp->offset, SIZE_MAX);
 	window_pane_update_used_data(wp, &cp->queued, SIZE_MAX);
 }
 
@@ -864,10 +916,33 @@ control_write_pending(struct client *c, struct control_pane *cp, size_t limit)
 		cb = TAILQ_FIRST(&cp->blocks);
 		age = (cb->t < t) ? t - cb->t : 0;
 
-		/* Render a repaint the first time the drain loop reaches it. */
+		/*
+		 * Render a repaint the first time the drain loop reaches it.
+		 * The frame reflects the grid as parsed right now: consume
+		 * the pane data up to here so drain-complete can tell whether
+		 * the pane produced more while the frame was in flight, and
+		 * re-anchor the replay watermark past what this frame shows
+		 * (the visible rows count as seen, so a follow-up frame
+		 * replays only lines the client does not have; on the
+		 * alternate screen nothing scrolls into history, so the
+		 * watermark just re-anchors).
+		 */
 		if (cb->type == CONTROL_BLOCK_REPAINT) {
-			if (cb->repaint == NULL)
+			if (cb->repaint == NULL) {
 				cb->repaint = control_build_repaint(wp, cp);
+				window_pane_update_used_data(wp, &cp->offset,
+				    SIZE_MAX);
+				grid_history_get_state(wp->base.grid,
+				    &cp->resync_state);
+				if (!SCREEN_IS_ALTERNATE(&wp->base)) {
+					cp->resync_state.added +=
+					    screen_size_y(&wp->base);
+				}
+				cp->resync_sx = screen_size_x(&wp->base);
+				cp->last_repaint =
+				    EVBUFFER_LENGTH(cb->repaint);
+				cp->resync_overflow = 0;
+			}
 			remaining = EVBUFFER_LENGTH(cb->repaint);
 		} else
 			remaining = cb->size;
@@ -1075,11 +1150,16 @@ control_build_repaint(struct window_pane *wp, struct control_pane *cp)
 }
 
 /*
- * Finish any resync whose repaint has fully drained. Reaching this on a
- * writable callback means the client has room again, so resume normal streaming
- * from the current parser position; output produced while discarding is skipped
- * (a gap, never a duplicate). A pane whose repaint is still queued stays in
- * resync.
+ * Finish any resync whose repaint frame has fully drained. Reaching this on a
+ * writable callback means the client has room again. If the pane produced no
+ * more than a frame's worth while the frame was in flight (and the anchor was
+ * not released), the delivered frame plus streaming the remainder is lossless
+ * and cheaper than repainting again: resume from the anchored position and
+ * queue the gap. Otherwise the delivered frame is already stale, so owe
+ * another one; this converges the first time a frame drains with the pane
+ * quiet, and a pane that never goes quiet degrades to a keyframe per drain
+ * period, each showing the then-current state. A pane whose frame is still
+ * queued stays in resync.
  */
 static void
 control_update_resyncs(struct client *c)
@@ -1087,21 +1167,47 @@ control_update_resyncs(struct client *c)
 	struct control_state	*cs = c->control_state;
 	struct control_pane	*cp;
 	struct window_pane	*wp;
+	struct grid		*gd;
+	size_t			 new_size;
+	u_int			 missed, threshold, sy;
 
 	RB_FOREACH(cp, control_panes, &cs->panes) {
 		if (cp->state != CONTROL_PANE_RESYNC || !TAILQ_EMPTY(&cp->blocks))
 			continue;
 		wp = control_window_pane(c, cp->pane);
-		if (wp != NULL && wp->fd != -1) {
-			log_debug("%s: %s: resync of %%%u delivered", __func__,
-			    c->name, cp->pane);
-			memcpy(&cp->offset, &wp->offset, sizeof cp->offset);
-			memcpy(&cp->queued, &wp->offset, sizeof cp->queued);
-		} else {
+		if (wp == NULL || wp->fd == -1) {
 			log_debug("%s: %s: %%%u gone, ending resync", __func__,
 			    c->name, cp->pane);
+			cp->state = CONTROL_PANE_ON;
+			continue;
 		}
+
+		/*
+		 * The gap must be small in bytes (cheaper to stream than to
+		 * repaint) and in scrolled lines (or resuming would trip the
+		 * behind trigger straight away and lose replay coverage);
+		 * resync_state was re-anchored past the delivered frame, so
+		 * missed counts only lines that frame did not show.
+		 */
+		window_pane_get_new_data(wp, &cp->offset, &new_size);
+		gd = wp->base.grid;
+		sy = screen_size_y(&wp->base);
+		missed = grid_history_missed(gd, &cp->resync_state);
+		threshold = (gd->hlimit > 2 * sy) ? gd->hlimit : 2 * sy;
+		if (cp->resync_overflow || new_size > cp->last_repaint ||
+		    missed >= threshold) {
+			log_debug("%s: %s: %%%u advanced %zu during repaint "
+			    "(overflow %d), queueing another", __func__,
+			    c->name, cp->pane, new_size, cp->resync_overflow);
+			control_queue_repaint(c, cp);
+			continue;
+		}
+		log_debug("%s: %s: resync of %%%u delivered, %zu to stream",
+		    __func__, c->name, cp->pane, new_size);
+		memcpy(&cp->queued, &cp->offset, sizeof cp->queued);
 		cp->state = CONTROL_PANE_ON;
+		if (new_size != 0)
+			control_write_output(c, wp);
 	}
 }
 
