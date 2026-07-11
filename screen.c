@@ -1020,9 +1020,14 @@ screen_repaint_state(struct evbuffer *msg, struct screen *s)
 
 /*
  * Replay history lines [from, to) so they feed the client's own scrollback.
- * Lines are written at the bottom row so each true line end scrolls one line
- * up; wrapped logical lines are joined and re-wrapped by the client, with
- * autowrap forced on for the replay.
+ * Lines are written at the bottom row with the scrolling newline BEFORE each
+ * line (not after), so the row already on the bottom - the client's newest
+ * pre-gap line - is scrolled up rather than overwritten, and no trailing
+ * blank row is left behind. Wrapped logical lines are joined (no newline
+ * between their rows) and re-wrapped by the client, with autowrap forced on
+ * for the replay. The last replayed line is left on the bottom row; the
+ * caller scrolls the whole visible tail into the client's scrollback before
+ * painting over it.
  */
 static void
 screen_repaint_replay(struct evbuffer *msg, struct screen *s, u_int sx,
@@ -1031,14 +1036,17 @@ screen_repaint_replay(struct evbuffer *msg, struct screen *s, u_int sx,
 	struct grid		*gd = s->grid;
 	const struct grid_line	*gl;
 	u_int			 py;
+	int			 wrapped = 0;
 
 	evbuffer_add_printf(msg, "\033[?7h\033[%u;1H", sy);
 	for (py = from; py < to; py++) {
+		if (!wrapped)
+			screen_repaint_add(msg, "\033[m\r\n");
 		screen_repaint_row(msg, s, py, sx);
 		gl = grid_peek_line(gd, py);
-		if (gl == NULL || (~gl->flags & GRID_LINE_WRAPPED))
-			screen_repaint_add(msg, "\033[m\r\n");
+		wrapped = (gl != NULL && (gl->flags & GRID_LINE_WRAPPED));
 	}
+	screen_repaint_add(msg, "\033[m");
 }
 
 /*
@@ -1066,8 +1074,20 @@ screen_repaint(struct screen *s, const struct grid_history_state *from,
 	if (!alt && gd->hsize != 0 && sx == owidth)
 		gap = grid_history_delta(gd, from);
 	screen_repaint_tabs(msg, s, sx);
-	if (gap != 0)
-		screen_repaint_replay(msg, s, sx, sy, gd->hsize - gap, gd->hsize);
+	if (gap != 0) {
+		screen_repaint_replay(msg, s, sx, sy, gd->hsize - gap,
+		    gd->hsize);
+
+		/*
+		 * The tail of the replay is sitting on the visible rows: kick
+		 * it up into the client's scrollback before the screen paint
+		 * below overwrites it in place, or those lines never reach the
+		 * scrollback at all. The blank rows this scrolls in are never
+		 * seen because every visible row is painted next.
+		 */
+		for (ry = 0; ry < sy; ry++)
+			screen_repaint_add(msg, "\r\n");
+	}
 
 	/* Enter the alternate screen before painting its contents. */
 	if (alt)
